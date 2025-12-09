@@ -703,8 +703,8 @@ async def search_patents(request: dict):
     start_time = datetime.now()
     debug_log = []
     
-    molecule = request.get("nome_molecula", "").strip()
-    brand = request.get("nome_comercial", "").strip()
+    molecule = (request.get("nome_molecula") or "").strip()
+    brand = (request.get("nome_comercial") or "").strip()
     
     if not molecule:
         raise HTTPException(status_code=400, detail="nome_molecula is required")
