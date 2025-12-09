@@ -1,12 +1,6 @@
 """
-Pharmyrus API v7.1 TURBO
-Fast Brazilian Patent Search - Optimized for Railway timeout
-
-Key optimizations:
-- Parallel processing (not sequential)
-- Limited to 25 most relevant WOs
-- Single API call per WO
-- 25 second total timeout
+Pharmyrus API v7.2 DIAGNOSTIC
+Versão para diagnóstico - mostra erros reais e testa múltiplos métodos
 """
 
 import asyncio
@@ -14,18 +8,14 @@ import httpx
 import re
 import os
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Pharmyrus API", version="7.1-turbo")
+app = FastAPI(title="Pharmyrus DIAGNOSTIC", version="7.2")
 
-# API Keys
 SERPAPI_KEYS = [
     "3f22448f4d43ce8259fa2f7f6385222323a67c4ce4e72fcc774b43d23812889d",
     "bc20bca64032a7ac59abf330bbdeca80aa79cd72bb208059056b10fb6e33e4bc",
-    "aad6d736889f91f9e7fe5a094336589404d04eda73fee9b158e328c2bd5a4d7e",
-    "d3b97e647e940af0b9bb5d37605cae9a8f59c495e6764630da8477434be4ce81",
 ]
 
 key_index = 0
@@ -36,315 +26,499 @@ def get_key():
     key_index += 1
     return key
 
-# Fast HTTP client
-async def fetch(url: str, params: dict = None, timeout: float = 10.0) -> dict:
+async def fetch_raw(url: str, params: dict = None, timeout: float = 30.0) -> dict:
+    """Fetch with full error details"""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(url, params=params)
-            return r.json() if r.status_code == 200 else {}
-    except:
-        return {}
-
-# Extract WO numbers from text
-def extract_wos(text: str) -> set:
-    wos = set()
-    for m in re.findall(r'WO[\s-]?(\d{4})[\s/]?(\d{6})', text, re.I):
-        wos.add(f"WO{m[0]}{m[1]}")
-    return wos
-
-# ============================================================================
-# PHASE 1: PubChem (fast)
-# ============================================================================
-async def get_pubchem(molecule: str) -> dict:
-    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{molecule}/synonyms/JSON"
-    data = await fetch(url)
-    
-    dev_codes, cas = [], None
-    try:
-        syns = data.get("InformationList", {}).get("Information", [{}])[0].get("Synonym", [])
-        for s in syns[:100]:
-            if re.match(r'^[A-Z]{2,5}-?\d{3,7}[A-Z]?$', s, re.I) and len(dev_codes) < 20:
-                dev_codes.append(s)
-            if re.match(r'^\d{2,7}-\d{2}-\d$', s) and not cas:
-                cas = s
-    except:
-        pass
-    
-    return {"dev_codes": dev_codes, "cas": cas}
-
-# ============================================================================
-# PHASE 2: WO Discovery (parallel, fast)
-# ============================================================================
-async def discover_wos(molecule: str, dev_codes: list) -> list:
-    queries = [
-        f'"{molecule}" patent WO',
-        f'"{molecule}" Orion Corporation patent',
-        f'"{molecule}" Bayer patent',
-        f'"{molecule}" pharmaceutical composition WO',
-    ]
-    
-    # Add dev code queries
-    for dev in dev_codes[:5]:
-        queries.append(f'"{dev}" patent WO')
-    
-    all_wos = set()
-    
-    # Parallel search
-    async def search_one(q):
-        params = {"engine": "google_patents", "q": q, "api_key": get_key(), "num": "30"}
-        data = await fetch("https://serpapi.com/search.json", params)
-        wos = set()
-        for r in data.get("organic_results", []):
-            text = f"{r.get('title', '')} {r.get('snippet', '')} {r.get('publication_number', '')}"
-            wos.update(extract_wos(text))
-            # Direct publication number
-            pn = r.get("publication_number", "")
-            if pn.startswith("WO"):
-                wos.add(re.sub(r'[A-Z]\d*$', '', pn))
-        return wos
-    
-    tasks = [search_one(q) for q in queries]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for r in results:
-        if isinstance(r, set):
-            all_wos.update(r)
-    
-    return sorted(list(all_wos))
-
-# ============================================================================
-# PHASE 3: Extract BR from WO (parallel, fast)
-# ============================================================================
-async def extract_br_from_wo(wo: str) -> dict:
-    """Single fast call to get BR patents from WO"""
-    result = {"wo": wo, "br_patents": [], "status": "pending"}
-    
-    try:
-        # Direct patent details
-        params = {"engine": "google_patents_details", "patent_id": wo, "api_key": get_key()}
-        data = await fetch("https://serpapi.com/search.json", params, timeout=15.0)
-        
-        if not data or data.get("error"):
-            result["status"] = "no_data"
-            return result
-        
-        # Extract from worldwide_applications
-        worldwide = data.get("worldwide_applications", {})
-        for year, apps in worldwide.items():
-            if isinstance(apps, list):
-                for app in apps:
-                    doc_id = app.get("document_id", "")
-                    if doc_id.startswith("BR"):
-                        result["br_patents"].append({
-                            "number": doc_id,
-                            "filing_date": app.get("filing_date", ""),
-                            "status": app.get("status", ""),
-                            "from_wo": wo,
-                            "source": "worldwide_applications"
-                        })
-        
-        # Extract from family_members
-        for member in data.get("family_members", []):
-            doc_id = member.get("document_id", "") or member.get("publication_number", "")
-            if doc_id.startswith("BR"):
-                if not any(p["number"] == doc_id for p in result["br_patents"]):
-                    result["br_patents"].append({
-                        "number": doc_id,
-                        "title": member.get("title", ""),
-                        "from_wo": wo,
-                        "source": "family_members"
-                    })
-        
-        # Extract from also_published_as
-        for pub in data.get("also_published_as", []):
-            doc_id = pub if isinstance(pub, str) else pub.get("document_id", "")
-            if doc_id.startswith("BR"):
-                if not any(p["number"] == doc_id for p in result["br_patents"]):
-                    result["br_patents"].append({
-                        "number": doc_id,
-                        "from_wo": wo,
-                        "source": "also_published_as"
-                    })
-        
-        # Store WO details
-        result["wo_details"] = {
-            "title": data.get("title", ""),
-            "assignee": data.get("assignee", ""),
-            "filing_date": data.get("filing_date", ""),
-            "inventors": data.get("inventors", [])[:5]
-        }
-        
-        result["status"] = "success" if result["br_patents"] else "no_br"
-        
+            return {
+                "status_code": r.status_code,
+                "success": r.status_code == 200,
+                "data": r.json() if r.status_code == 200 else None,
+                "error": r.text[:500] if r.status_code != 200 else None
+            }
     except Exception as e:
-        result["status"] = "error"
-        result["error"] = str(e)
+        return {"success": False, "error": str(e), "status_code": 0}
+
+# ============================================================================
+# TEST 1: Testar google_patents_details diretamente
+# ============================================================================
+async def test_patent_details(wo: str) -> dict:
+    """Testa google_patents_details com diferentes formatos"""
+    results = {}
+    
+    # Formato 1: WO2016096610
+    params1 = {
+        "engine": "google_patents_details",
+        "patent_id": wo,
+        "api_key": get_key()
+    }
+    results["format_wo_number"] = await fetch_raw("https://serpapi.com/search.json", params1)
+    await asyncio.sleep(0.5)
+    
+    # Formato 2: Com A1 no final (WO2016096610A1)
+    params2 = {
+        "engine": "google_patents_details", 
+        "patent_id": f"{wo}A1",
+        "api_key": get_key()
+    }
+    results["format_wo_a1"] = await fetch_raw("https://serpapi.com/search.json", params2)
+    await asyncio.sleep(0.5)
+    
+    # Formato 3: Com A2 no final
+    params3 = {
+        "engine": "google_patents_details",
+        "patent_id": f"{wo}A2",
+        "api_key": get_key()
+    }
+    results["format_wo_a2"] = await fetch_raw("https://serpapi.com/search.json", params3)
+    
+    return results
+
+# ============================================================================
+# TEST 2: Testar via google_patents search + serpapi_link
+# ============================================================================
+async def test_search_chain(wo: str) -> dict:
+    """Testa o método search → serpapi_link"""
+    results = {}
+    
+    # Step 1: Search
+    params = {
+        "engine": "google_patents",
+        "q": wo,
+        "api_key": get_key(),
+        "num": "5"
+    }
+    search_result = await fetch_raw("https://serpapi.com/search.json", params)
+    results["search"] = search_result
+    
+    if search_result.get("success") and search_result.get("data"):
+        organic = search_result["data"].get("organic_results", [])
+        results["organic_count"] = len(organic)
+        
+        if organic:
+            first = organic[0]
+            results["first_result"] = {
+                "title": first.get("title"),
+                "publication_number": first.get("publication_number"),
+                "patent_id": first.get("patent_id"),
+                "serpapi_link": first.get("serpapi_link"),
+                "pdf": first.get("pdf"),
+                "snippet": first.get("snippet", "")[:200]
+            }
+            
+            # Step 2: Follow serpapi_link
+            serpapi_link = first.get("serpapi_link")
+            if serpapi_link:
+                await asyncio.sleep(0.5)
+                # Add API key
+                if "api_key=" not in serpapi_link:
+                    serpapi_link = f"{serpapi_link}&api_key={get_key()}"
+                
+                detail_result = await fetch_raw(serpapi_link)
+                results["serpapi_link_result"] = {
+                    "success": detail_result.get("success"),
+                    "status_code": detail_result.get("status_code"),
+                    "error": detail_result.get("error")
+                }
+                
+                if detail_result.get("success") and detail_result.get("data"):
+                    data = detail_result["data"]
+                    results["patent_data"] = {
+                        "title": data.get("title"),
+                        "abstract": (data.get("abstract") or "")[:300],
+                        "assignee": data.get("assignee"),
+                        "inventors": data.get("inventors", [])[:5],
+                        "filing_date": data.get("filing_date"),
+                        "publication_date": data.get("publication_date"),
+                        "has_worldwide_applications": "worldwide_applications" in data,
+                        "worldwide_applications_keys": list(data.get("worldwide_applications", {}).keys()),
+                        "has_family_members": "family_members" in data,
+                        "family_members_count": len(data.get("family_members", [])),
+                        "has_also_published_as": "also_published_as" in data,
+                        "also_published_as_count": len(data.get("also_published_as", []))
+                    }
+                    
+                    # Extract BR patents
+                    br_patents = []
+                    worldwide = data.get("worldwide_applications", {})
+                    for year, apps in worldwide.items():
+                        if isinstance(apps, list):
+                            for app in apps:
+                                doc_id = app.get("document_id", "")
+                                if doc_id.startswith("BR"):
+                                    br_patents.append({
+                                        "number": doc_id,
+                                        "filing_date": app.get("filing_date"),
+                                        "status": app.get("status"),
+                                        "source": "worldwide_applications"
+                                    })
+                    
+                    for member in data.get("family_members", []):
+                        doc_id = member.get("document_id", "") or member.get("publication_number", "")
+                        if doc_id.startswith("BR"):
+                            br_patents.append({
+                                "number": doc_id,
+                                "title": member.get("title"),
+                                "source": "family_members"
+                            })
+                    
+                    for pub in data.get("also_published_as", []):
+                        doc_id = pub if isinstance(pub, str) else pub.get("document_id", "")
+                        if doc_id.startswith("BR"):
+                            br_patents.append({"number": doc_id, "source": "also_published_as"})
+                    
+                    results["br_patents_found"] = br_patents
+    
+    return results
+
+# ============================================================================
+# ENDPOINT: Diagnóstico completo de uma WO
+# ============================================================================
+@app.get("/diagnose/{wo}")
+async def diagnose_wo(wo: str):
+    """Diagnóstico completo de uma WO específica"""
+    start = datetime.now()
+    
+    # Clean WO format
+    wo = wo.upper().strip()
+    if not wo.startswith("WO"):
+        wo = f"WO{wo}"
+    
+    results = {
+        "wo_number": wo,
+        "tests": {}
+    }
+    
+    # Test 1: Direct patent details
+    results["tests"]["direct_details"] = await test_patent_details(wo)
+    
+    await asyncio.sleep(1)
+    
+    # Test 2: Search chain
+    results["tests"]["search_chain"] = await test_search_chain(wo)
+    
+    results["duration_seconds"] = round((datetime.now() - start).total_seconds(), 1)
+    
+    return results
+
+# ============================================================================
+# ENDPOINT: Buscar uma WO e trazer TODO o conteúdo
+# ============================================================================
+@app.get("/wo/{wo_number}")
+async def get_wo_full_content(wo_number: str):
+    """Retorna todo o conteúdo de uma WO específica"""
+    
+    wo = wo_number.upper().strip()
+    if not wo.startswith("WO"):
+        wo = f"WO{wo}"
+    
+    result = {
+        "wo_number": wo,
+        "wo_content": None,
+        "br_patents": [],
+        "all_countries": {},
+        "status": "pending"
+    }
+    
+    # Search for the WO
+    params = {
+        "engine": "google_patents",
+        "q": wo,
+        "api_key": get_key(),
+        "num": "10"
+    }
+    
+    search = await fetch_raw("https://serpapi.com/search.json", params)
+    
+    if not search.get("success"):
+        result["status"] = "search_failed"
+        result["error"] = search.get("error")
+        return result
+    
+    organic = search.get("data", {}).get("organic_results", [])
+    if not organic:
+        result["status"] = "no_results"
+        return result
+    
+    # Find exact match
+    target = None
+    for r in organic:
+        pub_num = r.get("publication_number", "")
+        patent_id = r.get("patent_id", "")
+        if wo in pub_num or wo in patent_id:
+            target = r
+            break
+    
+    if not target:
+        target = organic[0]
+    
+    result["search_result"] = {
+        "title": target.get("title"),
+        "publication_number": target.get("publication_number"),
+        "snippet": target.get("snippet"),
+        "pdf": target.get("pdf")
+    }
+    
+    # Follow serpapi_link
+    serpapi_link = target.get("serpapi_link")
+    if not serpapi_link:
+        result["status"] = "no_serpapi_link"
+        return result
+    
+    await asyncio.sleep(0.5)
+    
+    if "api_key=" not in serpapi_link:
+        serpapi_link = f"{serpapi_link}&api_key={get_key()}"
+    
+    detail = await fetch_raw(serpapi_link)
+    
+    if not detail.get("success"):
+        result["status"] = "detail_failed"
+        result["error"] = detail.get("error")
+        return result
+    
+    data = detail.get("data", {})
+    
+    # Full WO content
+    result["wo_content"] = {
+        "title": data.get("title"),
+        "abstract": data.get("abstract"),
+        "assignee": data.get("assignee"),
+        "applicant": data.get("applicant"),
+        "inventors": data.get("inventors"),
+        "filing_date": data.get("filing_date"),
+        "publication_date": data.get("publication_date"),
+        "priority_date": data.get("priority_date"),
+        "grant_date": data.get("grant_date"),
+        "legal_status": data.get("legal_status"),
+        "classifications": data.get("classifications", [])[:10],
+        "claims": data.get("claims", [])[:5],  # First 5 claims
+        "description_preview": (data.get("description") or "")[:1000],
+        "pdf": data.get("pdf"),
+        "images": data.get("images", [])[:3]
+    }
+    
+    # Extract ALL countries from worldwide_applications
+    worldwide = data.get("worldwide_applications", {})
+    for year, apps in worldwide.items():
+        if isinstance(apps, list):
+            for app in apps:
+                doc_id = app.get("document_id", "")
+                country = doc_id[:2] if doc_id else "??"
+                
+                if country not in result["all_countries"]:
+                    result["all_countries"][country] = []
+                
+                result["all_countries"][country].append({
+                    "number": doc_id,
+                    "filing_date": app.get("filing_date"),
+                    "publication_date": app.get("publication_date"),
+                    "status": app.get("status"),
+                    "title": app.get("title"),
+                    "year": year
+                })
+                
+                # Collect BR
+                if country == "BR":
+                    result["br_patents"].append({
+                        "number": doc_id,
+                        "filing_date": app.get("filing_date"),
+                        "status": app.get("status"),
+                        "source": "worldwide_applications"
+                    })
+    
+    # Also from family_members
+    for member in data.get("family_members", []):
+        doc_id = member.get("document_id", "") or member.get("publication_number", "")
+        if doc_id.startswith("BR"):
+            if not any(p["number"] == doc_id for p in result["br_patents"]):
+                result["br_patents"].append({
+                    "number": doc_id,
+                    "title": member.get("title"),
+                    "source": "family_members"
+                })
+    
+    # From also_published_as
+    for pub in data.get("also_published_as", []):
+        doc_id = pub if isinstance(pub, str) else pub.get("document_id", "")
+        if doc_id.startswith("BR"):
+            if not any(p["number"] == doc_id for p in result["br_patents"]):
+                result["br_patents"].append({
+                    "number": doc_id,
+                    "source": "also_published_as"
+                })
+    
+    result["status"] = "success"
+    result["countries_found"] = list(result["all_countries"].keys())
+    result["total_country_patents"] = sum(len(v) for v in result["all_countries"].values())
+    result["br_count"] = len(result["br_patents"])
     
     return result
 
 # ============================================================================
-# PHASE 4: INPI Direct (fast)
+# ENDPOINT: Buscar BR diretamente
 # ============================================================================
-async def search_inpi(molecule: str, dev_codes: list) -> list:
-    patents = []
+@app.get("/br/{br_number}")
+async def get_br_content(br_number: str):
+    """Retorna todo o conteúdo de uma patente BR"""
+    
+    br = br_number.upper().strip()
+    if not br.startswith("BR"):
+        br = f"BR{br}"
+    
+    # Try direct details
+    params = {
+        "engine": "google_patents_details",
+        "patent_id": br,
+        "api_key": get_key()
+    }
+    
+    result = await fetch_raw("https://serpapi.com/search.json", params)
+    
+    if result.get("success") and result.get("data"):
+        data = result["data"]
+        return {
+            "br_number": br,
+            "status": "success",
+            "method": "direct_details",
+            "content": {
+                "title": data.get("title"),
+                "abstract": data.get("abstract"),
+                "assignee": data.get("assignee"),
+                "applicant": data.get("applicant"),
+                "inventors": data.get("inventors"),
+                "filing_date": data.get("filing_date"),
+                "publication_date": data.get("publication_date"),
+                "grant_date": data.get("grant_date"),
+                "legal_status": data.get("legal_status"),
+                "claims": data.get("claims", [])[:5],
+                "classifications": data.get("classifications", [])[:10],
+                "pdf": data.get("pdf")
+            }
+        }
+    
+    # Try via search
+    await asyncio.sleep(0.5)
+    
+    search_params = {
+        "engine": "google_patents",
+        "q": br,
+        "api_key": get_key()
+    }
+    
+    search = await fetch_raw("https://serpapi.com/search.json", search_params)
+    
+    if search.get("success"):
+        organic = search.get("data", {}).get("organic_results", [])
+        if organic:
+            serpapi_link = organic[0].get("serpapi_link")
+            if serpapi_link:
+                await asyncio.sleep(0.5)
+                if "api_key=" not in serpapi_link:
+                    serpapi_link = f"{serpapi_link}&api_key={get_key()}"
+                
+                detail = await fetch_raw(serpapi_link)
+                if detail.get("success"):
+                    data = detail["data"]
+                    return {
+                        "br_number": br,
+                        "status": "success",
+                        "method": "search_chain",
+                        "content": {
+                            "title": data.get("title"),
+                            "abstract": data.get("abstract"),
+                            "assignee": data.get("assignee"),
+                            "applicant": data.get("applicant"),
+                            "inventors": data.get("inventors"),
+                            "filing_date": data.get("filing_date"),
+                            "publication_date": data.get("publication_date"),
+                            "grant_date": data.get("grant_date"),
+                            "legal_status": data.get("legal_status"),
+                            "claims": data.get("claims", [])[:5],
+                            "pdf": data.get("pdf")
+                        }
+                    }
+    
+    return {
+        "br_number": br,
+        "status": "failed",
+        "error": "Could not retrieve patent details"
+    }
+
+# ============================================================================
+# ENDPOINT: INPI Direto
+# ============================================================================
+@app.get("/inpi/{molecule}")
+async def search_inpi_direct(molecule: str):
+    """Busca direta no INPI"""
+    
+    results = []
     terms = [molecule, molecule.lower()]
     
     # Portuguese variation
     if molecule.lower().endswith("ide"):
         terms.append(molecule[:-3] + "ida")
+    if molecule.lower().endswith("ine"):
+        terms.append(molecule[:-3] + "ina")
     
-    for dev in dev_codes[:3]:
-        terms.append(dev)
-    
-    for term in terms[:6]:
-        try:
-            url = f"https://crawler3-production.up.railway.app/api/data/inpi/patents?medicine={term}"
-            data = await fetch(url, timeout=10.0)
-            
-            for p in data.get("data", []):
+    for term in terms:
+        url = f"https://crawler3-production.up.railway.app/api/data/inpi/patents?medicine={term}"
+        data = await fetch_raw(url, timeout=60.0)
+        
+        if data.get("success") and data.get("data"):
+            for p in data["data"].get("data", []):
                 title = p.get("title", "")
                 if title.startswith("BR"):
-                    patents.append({
+                    results.append({
                         "number": title.replace(" ", "-"),
-                        "applicant": p.get("applicant", ""),
-                        "deposit_date": p.get("depositDate", ""),
-                        "source": "inpi_direct"
+                        "applicant": p.get("applicant"),
+                        "deposit_date": p.get("depositDate"),
+                        "full_text": p.get("fullText", "")[:500],
+                        "search_term": term
                     })
-        except:
-            pass
     
     # Dedupe
     seen = set()
     unique = []
-    for p in patents:
+    for p in results:
         n = re.sub(r'[\s\-/]', '', p["number"]).upper()
         if n not in seen:
             seen.add(n)
             unique.append(p)
     
-    return unique
-
-# ============================================================================
-# MAIN SEARCH - OPTIMIZED
-# ============================================================================
-@app.post("/search")
-async def search_patents(request: dict):
-    start = datetime.now()
-    
-    molecule = (request.get("nome_molecula") or "").strip()
-    brand = (request.get("nome_comercial") or "").strip()
-    
-    if not molecule:
-        raise HTTPException(400, "nome_molecula required")
-    
-    # Phase 1: PubChem (fast)
-    pubchem = await get_pubchem(molecule)
-    
-    # Phase 2: WO Discovery (parallel)
-    all_wos = await discover_wos(molecule, pubchem["dev_codes"])
-    
-    # LIMIT to 25 most relevant WOs (prioritize recent years)
-    # Sort by year descending, take top 25
-    def get_year(wo):
-        try:
-            return int(wo[2:6])
-        except:
-            return 2000
-    
-    sorted_wos = sorted(all_wos, key=get_year, reverse=True)
-    top_wos = sorted_wos[:25]
-    
-    # Phase 3: Extract BR from each WO (PARALLEL - key optimization!)
-    tasks = [extract_br_from_wo(wo) for wo in top_wos]
-    wo_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Collect results
-    all_br = []
-    wo_summary = []
-    
-    for r in wo_results:
-        if isinstance(r, dict):
-            wo_summary.append({
-                "wo": r.get("wo"),
-                "br_count": len(r.get("br_patents", [])),
-                "status": r.get("status"),
-                "wo_title": r.get("wo_details", {}).get("title", "")[:80]
-            })
-            for br in r.get("br_patents", []):
-                if not any(p["number"] == br["number"] for p in all_br):
-                    all_br.append(br)
-    
-    # Phase 4: INPI Direct (parallel)
-    inpi_patents = await search_inpi(molecule, pubchem["dev_codes"])
-    
-    # Merge INPI results
-    for p in inpi_patents:
-        norm = re.sub(r'[\s\-/]', '', p["number"]).upper()
-        if not any(re.sub(r'[\s\-/]', '', br["number"]).upper() == norm for br in all_br):
-            all_br.append(p)
-    
-    duration = (datetime.now() - start).total_seconds()
-    
     return {
-        "api_version": "7.1 TURBO",
         "molecule": molecule,
-        "brand": brand or None,
-        "pubchem": {
-            "dev_codes": pubchem["dev_codes"][:10],
-            "cas": pubchem["cas"]
-        },
-        "wo_discovery": {
-            "total_found": len(all_wos),
-            "processed": len(top_wos),
-            "all_wos": all_wos,
-            "note": f"Processed top {len(top_wos)} most recent WOs"
-        },
-        "wo_processing": {
-            "summary": wo_summary,
-            "successful": len([w for w in wo_summary if w["status"] == "success"])
-        },
-        "br_patents": {
-            "total": len(all_br),
-            "from_wo": len([b for b in all_br if b.get("source") != "inpi_direct"]),
-            "from_inpi": len([b for b in all_br if b.get("source") == "inpi_direct"]),
-            "patents": all_br
-        },
-        "comparison": {
-            "expected": 8,
-            "found": len(all_br),
-            "rate": f"{min(100, round(len(all_br) / 8 * 100))}%",
-            "status": "EXCELLENT" if len(all_br) >= 6 else "GOOD" if len(all_br) >= 4 else "NEEDS_WORK"
-        },
-        "performance": {
-            "duration_seconds": round(duration, 1),
-            "wos_found": len(all_wos),
-            "wos_processed": len(top_wos),
-            "timestamp": datetime.now().isoformat()
-        }
+        "terms_searched": terms,
+        "total_found": len(unique),
+        "patents": unique
     }
 
-# Browser-friendly endpoint
-@app.get("/api/v1/search/{molecule}")
-async def search_by_url(molecule: str, brand: Optional[str] = None):
-    return await search_patents({"nome_molecula": molecule, "nome_comercial": brand})
-
+# ============================================================================
+# ROOT & HEALTH
+# ============================================================================
 @app.get("/")
 async def root():
     return {
-        "api": "Pharmyrus",
-        "version": "7.1 TURBO",
-        "description": "Fast Brazilian patent search",
+        "api": "Pharmyrus DIAGNOSTIC",
+        "version": "7.2",
         "endpoints": {
-            "GET /api/v1/search/{molecule}": "Search by URL",
-            "POST /search": "Search by JSON",
-            "GET /health": "Health check"
+            "GET /diagnose/{wo}": "Full diagnostic for a WO number",
+            "GET /wo/{wo_number}": "Get full content of a WO",
+            "GET /br/{br_number}": "Get full content of a BR patent",
+            "GET /inpi/{molecule}": "Search INPI directly"
         },
-        "example": "/api/v1/search/darolutamide"
+        "examples": {
+            "diagnose": "/diagnose/WO2016096610",
+            "wo_content": "/wo/WO2016096610",
+            "br_content": "/br/BR112017020400",
+            "inpi": "/inpi/darolutamide"
+        }
     }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.1-turbo"}
+    return {"status": "healthy", "version": "7.2-diagnostic"}
 
 if __name__ == "__main__":
     import uvicorn
